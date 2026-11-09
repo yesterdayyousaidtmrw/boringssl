@@ -218,10 +218,11 @@ BSSL_NAMESPACE_BEGIN
 
 // Bits for `algorithm_mkey` (key exchange algorithm).
 #define SSL_kRSA 0x00000001u
-#define SSL_kECDHE 0x00000002u
+#define SSL_kDHE 0x00000002u
+#define SSL_kECDHE 0x00000004u
 // SSL_kPSK is only set for plain PSK, not ECDHE_PSK.
-#define SSL_kPSK 0x00000004u
-#define SSL_kGENERIC 0x00000008u
+#define SSL_kPSK 0x00000008u
+#define SSL_kGENERIC 0x00000010u
 
 // Bits for `algorithm_auth` (server authentication).
 #define SSL_aRSA_SIGN 0x00000001u
@@ -246,8 +247,9 @@ BSSL_NAMESPACE_BEGIN
 // Bits for `algorithm_mac` (symmetric authentication).
 #define SSL_SHA1 0x00000001u
 #define SSL_SHA256 0x00000002u
+#define SSL_SHA384 0x00000004u
 // SSL_AEAD is set for all AEADs.
-#define SSL_AEAD 0x00000004u
+#define SSL_AEAD 0x00000008u
 
 // Bits for `algorithm_prf` (handshake digest).
 #define SSL_HANDSHAKE_MAC_DEFAULT 0x1
@@ -918,7 +920,7 @@ struct NamedGroup {
 Span<const NamedGroup> NamedGroups();
 
 // kNumNamedGroups is the number of supported groups.
-constexpr size_t kNumNamedGroups = 6u;
+constexpr size_t kNumNamedGroups = 8u;
 
 // DefaultSupportedGroupIds returns the list of IDs for the default groups that
 // are supported when the caller hasn't explicitly configured supported groups.
@@ -1923,6 +1925,9 @@ struct SSL_HANDSHAKE {
   // delegated credentials.
   Array<uint16_t> peer_delegated_credential_sigalgs;
 
+  Array<uint8_t> dh_p;
+  Array<uint8_t> dh_g;
+
   // peer_key is the peer's ECDH key for a TLS 1.2 client.
   Array<uint8_t> peer_key;
 
@@ -2235,8 +2240,17 @@ UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSLImpl *ssl,
                                                         CBS *body);
 
 // ssl_setup_extension_permutation computes a ClientHello extension permutation
-// for `hs`, if applicable. It returns true on success and false on error.
+// for `hs`, if applicable, shuffling any explicit order previously applied by
+// `ssl_set_extension_order`. It returns true on success and false on error.
 bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
+
+// curl-impersonate: ssl_parse_extension_order parses the explicit ClientHello
+// extension order into `out`. It returns true on success and false on error.
+bool ssl_parse_extension_order(Array<uint8_t> *out, const char *order);
+
+// ssl_set_extension_order applies the fork-specific explicit ClientHello
+// extension order, when configured.
+bool ssl_set_extension_order(SSL_HANDSHAKE *hs);
 
 // ssl_setup_pre_shared_keys computes the offered client PSKs and saves them in
 // `hs`. It returns true on success and false on failure.
@@ -3421,6 +3435,15 @@ struct SSL_CONFIG {
   // crypto
   UniquePtr<SSLCipherPreferenceList> cipher_list;
 
+  // curl-impersonate
+  Array<uint8_t> extension_order;
+
+  // curl-impersonate
+  UniquePtr<char> cipher_order;
+
+  // curl-impersonate
+  int key_usage_check_enabled = 1;
+
   // This is used to hold the local certificate used (i.e. the server
   // certificate for a server or the client certificate for a client).
   UniquePtr<CERT> cert;
@@ -3501,6 +3524,10 @@ struct SSL_CONFIG {
   // verify_sigalgs, if not empty, is the set of signature algorithms
   // accepted from the peer in decreasing order of preference.
   Array<uint16_t> verify_sigalgs;
+
+  // delegated_credentials, if not empty, is the set of signature algorithms
+  // supported by the client.
+  Array<uint16_t> delegated_credentials;
 
   // srtp_profiles is the list of configured SRTP protection profiles for
   // DTLS-SRTP.
@@ -3583,6 +3610,14 @@ struct SSL_CONFIG {
   // aes_hw_override if set indicates we should override checking for aes
   // hardware support, and use the value in aes_hw_override_value instead.
   bool aes_hw_override : 1;
+
+  // curl-impersonate: record_size_limit is whether to send record size limit
+  // extension.
+  uint16_t record_size_limit = 0;
+
+  // curl-impersonate: key_shares_limit is the maximum number of key shares to
+  // send.
+  uint8_t key_shares_limit = 0;
 
   // aes_hw_override_value is used for testing to indicate the support or lack
   // of support for AES hw. The value is only considered if `aes_hw_override` is
@@ -3966,6 +4001,15 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
 
   UniquePtr<SSLCipherPreferenceList> cipher_list;
 
+  // curl-impersonate
+  Array<uint8_t> extension_order;
+
+  // curl-impersonate
+  UniquePtr<char> cipher_order;
+
+  // curl-impersonate
+  int key_usage_check_enabled = 1;
+
   X509_STORE *cert_store = nullptr;
   LHASH_OF(SSL_SESSION) *sessions = nullptr;
   // Most session-ids that will be cached, default is
@@ -4200,6 +4244,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
   // available_client_cert_types inherited by SSL struct.
   InplaceVector<uint8_t, kNumCertTypes> available_client_cert_types;
 
+  // delegated_credentials, if not empty, is the set of signature algorithms
+  // supported by the client.
+  bssl::Array<uint16_t> delegated_credentials;
+
   // retain_only_sha256_of_client_certs is true if we should compute the SHA256
   // hash of the peer's certificate and then discard it to save memory and
   // session space. Only effective on the server side.
@@ -4260,6 +4308,13 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
   // resumption_across_names_enabled indicates whether a TLS 1.3 server should
   // signal its sessions may be resumed across names in the server certificate.
   bool resumption_across_names_enabled : 1;
+
+  // curl-impersonate: record_size_limit controls the ClientHello extension.
+  uint16_t record_size_limit = 0;
+
+  // curl-impersonate: key_shares_limit is the maximum number of initial key
+  // shares to send.
+  uint8_t key_shares_limit = 0;
 
  private:
   friend RefCounted;

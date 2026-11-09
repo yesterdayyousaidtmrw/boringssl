@@ -442,7 +442,9 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CLANG)
     # clang-cl sets different default warnings than clang. It also treats -Wall
     # as -Weverything, to match MSVC. Instead -W3 is the alias for -Wall.
     # See http://llvm.org/viewvc/llvm-project?view=revision&revision=319116
-    list(APPEND C_CXX_WARNINGS -W3 -Wno-unused-parameter)
+    # curl-impersonate: Consumers of the fork still build deprecated
+    # compatibility APIs with clang-cl.
+    list(APPEND C_CXX_WARNINGS -W3 -Wno-unused-parameter -Wno-deprecated)
   else()
     list(APPEND C_CXX_WARNINGS -Wall)
   endif()
@@ -761,8 +763,6 @@ if(FIPS)
   target_link_libraries(entropy_modulewrapper crypto)
 endif()
 
-add_executable(bssl ${BSSL_SOURCES})
-target_link_libraries(bssl ssl crypto)
 
 if(BUILD_TESTING)
   add_executable(generate_mldsa_certs pki/testdata/verify_unittest/generate_mldsa_certs.cc)
@@ -874,7 +874,6 @@ endif()
 
 if(INSTALL_ENABLED)
   install(TARGETS crypto ssl EXPORT OpenSSLTargets)
-  install(TARGETS bssl)
   install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(EXPORT OpenSSLTargets
           FILE OpenSSLTargets.cmake

@@ -5511,6 +5511,11 @@ extern "C" {
 #define SN_X_Wing "X-Wing"
 #define NID_X_Wing 972
 
+#define SN_ffdhe2048 "ffdhe2048"
+#define NID_ffdhe2048 973
+
+#define SN_ffdhe3072 "ffdhe3072"
+#define NID_ffdhe3072 974
 
 #if defined(__cplusplus)
 } /* extern C */

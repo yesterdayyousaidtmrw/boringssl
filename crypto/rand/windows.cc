@@ -60,6 +60,9 @@ void bssl::CRYPTO_sysrand(uint8_t *out, size_t requested) {
 typedef BOOL(WINAPI *ProcessPrngFunction)(PBYTE pbData, SIZE_T cbData);
 static ProcessPrngFunction g_processprng_fn = nullptr;
 
+typedef BOOL(WINAPI *RtlGenRandomFunction)(PVOID RandomBuffer, ULONG RandomBufferLength);
+static RtlGenRandomFunction g_rtlgenrandom_fn = nullptr;
+
 static void init_processprng() {
   HMODULE hmod = LoadLibraryW(L"bcryptprimitives");
   if (hmod == nullptr) {
@@ -67,7 +70,14 @@ static void init_processprng() {
   }
   g_processprng_fn = (ProcessPrngFunction)GetProcAddress(hmod, "ProcessPrng");
   if (g_processprng_fn == nullptr) {
-    abort();
+    hmod = LoadLibraryW(L"advapi32");
+    if (hmod == nullptr) {
+      abort();
+    }
+    g_rtlgenrandom_fn = (RtlGenRandomFunction)GetProcAddress(hmod, "SystemFunction036");
+    if (g_rtlgenrandom_fn == nullptr) {
+      abort();
+    }
   }
 }
 
@@ -81,8 +91,22 @@ void bssl::CRYPTO_sysrand(uint8_t *out, size_t requested) {
   // On non-UWP configurations, use ProcessPrng instead of BCryptGenRandom
   // to avoid accessing resources that may be unavailable inside the
   // Chromium sandbox. See https://crbug.com/74242
-  if (!g_processprng_fn(out, requested)) {
-    abort();
+  if (g_processprng_fn != NULL) {
+    if (!g_processprng_fn(out, requested)) {
+      abort();
+    }
+  } else {
+    while (requested > 0) {
+      ULONG output_bytes_this_pass = ULONG_MAX;
+      if (requested < output_bytes_this_pass) {
+        output_bytes_this_pass = (ULONG)requested;
+      }
+      if (g_rtlgenrandom_fn(out, output_bytes_this_pass) == FALSE) {
+        abort();
+      }
+      requested -= output_bytes_this_pass;
+      out += output_bytes_this_pass;
+    }
   }
 }
 

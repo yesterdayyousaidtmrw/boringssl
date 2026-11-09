@@ -26,6 +26,8 @@
 #include <openssl/aead.h>
 #include <openssl/bn.h>
 #include <openssl/bytestring.h>
+#include <openssl/dh.h>
+#include <../crypto/fipsmodule/dh/internal.h>
 #include <openssl/ec_key.h>
 #include <openssl/ecdsa.h>
 #include <openssl/err.h>
@@ -126,15 +128,44 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
         SSL_CIPHER_AES_128_GCM_SHA256,
         SSL_CIPHER_CHACHA20_POLY1305_SHA256,
     };
+    static const uint16_t kCiphersFirefox[] = {
+        TLS1_3_CK_AES_128_GCM_SHA256 & 0xffff,
+        TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
+        TLS1_3_CK_AES_256_GCM_SHA384 & 0xffff,
+    };
+    static const uint16_t kCiphersSafari26[] = {
+        TLS1_3_CK_AES_256_GCM_SHA384 & 0xffff,
+        TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
+        TLS1_3_CK_AES_128_GCM_SHA256 & 0xffff,
+    };
+    static const uint16_t kCiphersOther[] = {
+        TLS1_3_CK_CHACHA20_POLY1305_SHA256 & 0xffff,
+        TLS1_3_CK_AES_256_GCM_SHA384 & 0xffff,
+        TLS1_3_CK_AES_128_GCM_SHA256 & 0xffff,
+    };
 
-    const bool has_aes_hw = ssl->config->aes_hw_override
-                                ? ssl->config->aes_hw_override_value
-                                : EVP_has_aes_hardware();
+#define TLS13_CIPHER_LEN 74
+
+    const char *order = hs->config->cipher_order.get();
+    // printf("CIPHER ORDER IS %s\n", order);
+
+    // This may seem silly at the first sight, but it's actually faster and easier.
     const bssl::Span<const uint16_t> ciphers =
-        ssl->config->compliance_policy == ssl_compliance_policy_cnsa_202407
-            ? bssl::Span<const uint16_t>(kCiphersCNSA)
-            : (has_aes_hw ? bssl::Span<const uint16_t>(kCiphersAESHardware)
-                          : bssl::Span<const uint16_t>(kCiphersNoAESHardware));
+      order == nullptr ?
+        kCiphersAESHardware :
+        strncmp(order, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256", TLS13_CIPHER_LEN) == 0 ?
+          kCiphersAESHardware :
+        strncmp(order, "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384", TLS13_CIPHER_LEN) == 0 ?
+          kCiphersFirefox :
+        strncmp(order, "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256", TLS13_CIPHER_LEN) == 0 ?
+          kCiphersSafari26 :
+        strncmp(order, "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256", TLS13_CIPHER_LEN) == 0 ?
+          kCiphersCNSA :
+        strncmp(order, "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384", TLS13_CIPHER_LEN) == 0 ?
+          kCiphersNoAESHardware :
+        strncmp(order, "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256", TLS13_CIPHER_LEN) == 0 ?
+          kCiphersOther :
+          kCiphersAESHardware;  // default one
 
     for (auto cipher : ciphers) {
       if (!ssl_add_tls13_cipher(&child, cipher,
@@ -444,6 +475,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
   ssl_setup_client_certificate_type(hs);
   if (!ssl_setup_pre_shared_keys(hs) ||  //
       !ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
+      !ssl_set_extension_order(hs) ||
       !ssl_setup_extension_permutation(hs) ||
       !ssl_encrypt_client_hello(hs, Span(ech_enc, ech_enc_len)) ||
       !ssl_add_client_hello(hs)) {
@@ -1051,7 +1083,28 @@ static enum ssl_hs_wait_t do_read_server_key_exchange(SSL_HANDSHAKE *hs) {
     hs->peer_psk_identity_hint.reset(raw);
   }
 
-  if (alg_k & SSL_kECDHE) {
+  if (alg_k & SSL_kDHE) {
+    CBS dh_p, dh_g, dh_Ys;
+    if (!CBS_get_u16_length_prefixed(&server_key_exchange, &dh_p) ||
+        CBS_len(&dh_p) == 0 ||
+        !CBS_get_u16_length_prefixed(&server_key_exchange, &dh_g) ||
+        CBS_len(&dh_g) == 0 ||
+        !CBS_get_u16_length_prefixed(&server_key_exchange, &dh_Ys) ||
+        CBS_len(&dh_Ys) == 0) {
+      OPENSSL_PUT_ERROR(SSL, SSL_R_DECODE_ERROR);
+      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
+      return ssl_hs_error;
+    }
+
+    if (!hs->dh_p.CopyFrom(dh_p) || !hs->dh_g.CopyFrom(dh_g)) {
+      return ssl_hs_error;
+    }
+
+    /* Save the peer public key for later. */
+    if (!hs->peer_key.CopyFrom(dh_Ys)) {
+      return ssl_hs_error;
+    }
+  } else if (alg_k & SSL_kECDHE) {
     // Parse the server parameters.
     uint8_t group_type;
     uint16_t group_id;
@@ -1405,7 +1458,9 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
     ssl_key_usage_t intended_use = (alg_k & SSL_kRSA)
                                        ? key_usage_encipherment
                                        : key_usage_digital_signature;
-    if (!ssl_cert_check_key_usage(&leaf_cbs, intended_use)) {
+    // curl-impersonate: optionally disable the certificate key-usage check.
+    if (hs->config->key_usage_check_enabled &&
+        !ssl_cert_check_key_usage(&leaf_cbs, intended_use)) {
       return ssl_hs_error;
     }
   }
@@ -1474,6 +1529,72 @@ static enum ssl_hs_wait_t do_send_client_key_exchange(SSL_HANDSHAKE *hs) {
         !CBB_flush(&body)) {
       return ssl_hs_error;
     }
+  } else if (alg_k & SSL_kDHE) {
+    UniquePtr<DH> dh(DH_new());
+    if (dh == nullptr) {
+      return ssl_hs_error;
+    }
+
+    UniquePtr<BIGNUM> p(
+        BN_bin2bn(hs->dh_p.data(), hs->dh_p.size(), nullptr));
+    UniquePtr<BIGNUM> g(
+        BN_bin2bn(hs->dh_g.data(), hs->dh_g.size(), nullptr));
+    if (p == nullptr || g == nullptr) {
+      return ssl_hs_error;
+    }
+
+    const unsigned bits = BN_num_bits(p.get());
+    const size_t p_len = BN_num_bytes(p.get());
+    if (bits < 1024) {
+      OPENSSL_PUT_ERROR(SSL, SSL_R_BAD_DH_P_LENGTH);
+      return ssl_hs_error;
+    } else if (bits > 4096) {
+      /* Overly large DHE groups are prohibitively expensive, so enforce a limit
+       * to prevent a server from causing us to perform too expensive of a
+       * computation. */
+      OPENSSL_PUT_ERROR(SSL, SSL_R_DH_P_TOO_LONG);
+      return ssl_hs_error;
+    }
+
+    if (!DH_set0_pqg(dh.get(), p.get(), nullptr, g.get())) {
+      return ssl_hs_error;
+    }
+    p.release();
+    g.release();
+
+    CBB child;
+    if (!CBB_add_u16_length_prefixed(&body, &child)) {
+      return ssl_hs_error;
+    }
+
+    const BIGNUM *public_key;
+    if (!DH_generate_key(dh.get())) {
+      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
+      return ssl_hs_error;
+    }
+    DH_get0_key(dh.get(), &public_key, nullptr);
+    if (public_key == nullptr ||
+        !BN_bn2cbb_padded(&child, p_len, public_key)) {
+      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
+      return ssl_hs_error;
+    }
+
+    int secret_len = 0;
+    BIGNUM *peer_point = BN_bin2bn(hs->peer_key.data(), hs->peer_key.size(), nullptr);
+    if (peer_point == nullptr ||
+        !pms.InitForOverwrite(DH_size(dh.get())) ||
+        (secret_len = DH_compute_key(pms.data(), peer_point, dh.get())) <= 0) {
+      BN_free(peer_point);
+      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
+      return ssl_hs_error;
+    }
+
+    pms.Shrink(secret_len);
+    BN_free(peer_point);
+
+    hs->dh_p.Reset();
+    hs->dh_g.Reset();
+    hs->peer_key.Reset();
   } else if (alg_k & SSL_kECDHE) {
     CBB child;
     if (!CBB_add_u8_length_prefixed(&body, &child)) {
